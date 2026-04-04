@@ -261,6 +261,8 @@ def generate_ik_status_table(
     active: bool,
     solve_time: float,
     parse_time: float,
+    reload_status: str,
+    reload_detail: str,
     xr_state: XRState | None,
     controller: "IKController",
     robot: "BaseRobot",
@@ -275,6 +277,15 @@ def generate_ik_status_table(
     table.add_row("IK Status", f"[{status_style}]{status_text}[/{status_style}]")
     table.add_row("Solve Time", f"{solve_time * 1000:.2f} ms")
     table.add_row("Parse Time", f"{parse_time * 1000:.2f} ms")
+
+    reload_style_map = {
+        "ready": "dim",
+        "reloading": "bold yellow",
+        "done": "bold green",
+        "failed": "bold red",
+    }
+    reload_style = reload_style_map.get(reload_status.lower(), "dim")
+    table.add_row("Reload", f"[{reload_style}]{reload_detail}[/{reload_style}]")
 
     if active and xr_state:
         curr_poses = controller._get_device_poses(xr_state)
@@ -335,6 +346,9 @@ def generate_ik_controls_panel() -> Panel:
     text.append("\n• Press ", style="dim")
     text.append("A", style="bold cyan")
     text.append(" to run right EE absolute demo", style="dim")
+    text.append("\n• Press ", style="dim")
+    text.append("R", style="bold cyan")
+    text.append(" to reload robot class (keep solver/JIT)", style="dim")
 
     return Panel(
         text,
@@ -378,6 +392,7 @@ class IKWorker(threading.Thread):
         self.new_state_event = threading.Event()
         self.running = True
         self.teleop_loop = None  # Will be set when on_xr_update runs
+        self._worker_lock = threading.Lock()
 
     def update_state(self, state: XRState):
         """Thread-safe update of the latest state."""
@@ -415,40 +430,71 @@ class IKWorker(threading.Thread):
                 continue
 
             try:
-                q_current = self.state_container["q"]
-                was_active = self.controller.active
+                with self._worker_lock:
+                    q_current = self.state_container["q"]
+                    was_active = self.controller.active
 
-                t0 = time.perf_counter()
-                new_config = np.array(self.controller.step(state, q_current))
-                dt = time.perf_counter() - t0
+                    t0 = time.perf_counter()
+                    new_config = np.array(self.controller.step(state, q_current))
+                    dt = time.perf_counter() - t0
 
-                self.state_container["solve_time"] = dt
-                self.state_container["active"] = self.controller.active
-                is_active = self.controller.active
+                    self.state_container["solve_time"] = dt
+                    self.state_container["active"] = self.controller.active
+                    is_active = self.controller.active
 
-                if not was_active and is_active:
-                    self.logger.info("in_control start - Taking Snapshots")
-                    self.logger.info(
-                        f"Init XR: {list(self.controller.snapshot_xr.keys())}"
-                    )
-
-                if not np.array_equal(new_config, q_current):
-                    self.state_container["q"] = new_config
-                    joint_dict = {
-                        name: float(val)
-                        for name, val in zip(
-                            self.robot.actuated_joint_names, new_config
+                    if not was_active and is_active:
+                        self.logger.info("in_control start - Taking Snapshots")
+                        self.logger.info(
+                            f"Init XR: {list(self.controller.snapshot_xr.keys())}"
                         )
-                    }
 
-                    if self.teleop_loop and self.teleop_loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            self.teleop.publish_joint_state(joint_dict),
-                            self.teleop_loop,
-                        )
+                    if not np.array_equal(new_config, q_current):
+                        self.state_container["q"] = new_config
+                        joint_dict = {
+                            name: float(val)
+                            for name, val in zip(
+                                self.robot.actuated_joint_names, new_config
+                            )
+                        }
+
+                        if self.teleop_loop and self.teleop_loop.is_running():
+                            asyncio.run_coroutine_threadsafe(
+                                self.teleop.publish_joint_state(joint_dict),
+                                self.teleop_loop,
+                            )
 
             except Exception as e:
                 self.logger.error(f"Error in IK Worker: {e}")
+
+    def reload_robot_in_place(
+        self, replacement: "BaseRobot"
+    ) -> tuple[bool, str, np.ndarray]:
+        with self._worker_lock:
+            current_q = np.array(self.state_container.get("q", np.array([])))
+            default_q = np.array(replacement.get_default_config())
+            if current_q.size > 0 and current_q.shape != default_q.shape:
+                return (
+                    False,
+                    "Joint dimension changed; cannot patch robot in place without recreating solver",
+                    current_q,
+                )
+
+            # Keep solver identity unchanged by mutating the existing robot object.
+            live_robot = self.robot
+            live_robot.__class__ = replacement.__class__
+            live_robot_state = cast(dict[str, Any], cast(object, live_robot.__dict__))
+            replacement_state = cast(dict[str, Any], cast(object, replacement.__dict__))
+            live_robot_state.clear()
+            live_robot_state.update(replacement_state)
+
+            self.robot = live_robot
+            self.controller.robot = live_robot
+            self.controller.reset()
+            self.state_container["active"] = False
+
+            q_next = default_q if current_q.size == 0 else current_q
+            self.state_container["q"] = q_next
+            return True, "Robot class reloaded in-place (solver preserved)", q_next
 
 
 class TerminalKeyReader:
@@ -637,10 +683,13 @@ def main():
     solver = None
     controller = None
     ik_worker = None
+    robot_args: dict[str, Any] = {}
     state_container: dict[str, Any] = {
         "active": False,
         "solve_time": 0.0,
         "parse_time": 0.0,
+        "reload_status": "ready",
+        "reload_detail": "Ready (press R)",
         "xr_state": None,
     }
 
@@ -802,7 +851,7 @@ def main():
         )
         layout["right"].split_column(
             Layout(name="status", ratio=2),
-            Layout(name="controls", size=6),
+            Layout(name="controls", size=7),
         )
     else:
         # Split: Left (State), Right (Top: Events, Bottom: Legend)
@@ -821,6 +870,8 @@ def main():
 
         ee_demo_lock = threading.Lock()
         ee_demo_running = False
+        reload_lock = threading.Lock()
+        reload_running = False
 
         with TerminalKeyReader(enabled=True) as key_reader:
             with Live(layout, refresh_per_second=10, console=console):
@@ -841,6 +892,8 @@ def main():
                                 state_container["active"],
                                 state_container["solve_time"],
                                 state_container["parse_time"],
+                                state_container.get("reload_status", "ready"),
+                                state_container.get("reload_detail", "Ready (press R)"),
                                 state_container["xr_state"],
                                 controller,
                                 robot,
@@ -851,48 +904,152 @@ def main():
                         layout["logs"].update(generate_log_panel(log_queue))
 
                         key = key_reader.poll_key()
-                        if key and key.lower() in {"d", "a"} and ik_worker is not None:
-                            with ee_demo_lock:
-                                if ee_demo_running:
-                                    logger.info("EE demo is already running")
-                                else:
-                                    ee_demo_running = True
-                                    demo_key = key.lower()
+                        if key and ik_worker is not None:
+                            key_lower = key.lower()
+                            if key_lower in {"d", "a"}:
+                                with ee_demo_lock:
+                                    if ee_demo_running:
+                                        logger.info("EE demo is already running")
+                                    else:
+                                        ee_demo_running = True
+                                        demo_key = key_lower
+                                        active_controller = controller
+                                        active_robot = robot
+                                        if (
+                                            active_controller is None
+                                            or active_robot is None
+                                        ):
+                                            ee_demo_running = False
+                                            continue
 
-                                    def _run_demo() -> None:
-                                        nonlocal ee_demo_running
-                                        try:
-                                            current_q = np.array(
-                                                state_container.get("q", np.array([]))
+                                        def _run_demo() -> None:
+                                            nonlocal ee_demo_running
+                                            try:
+                                                current_q = np.array(
+                                                    state_container.get(
+                                                        "q", np.array([])
+                                                    )
+                                                )
+                                                if current_q.size == 0:
+                                                    return
+                                                if demo_key == "d":
+                                                    result_q = run_right_ee_delta_demo(
+                                                        active_controller,
+                                                        active_robot,
+                                                        teleop,
+                                                        current_q,
+                                                        ik_worker.teleop_loop,
+                                                        logger,
+                                                    )
+                                                else:
+                                                    result_q = (
+                                                        run_right_ee_absolute_demo(
+                                                            active_controller,
+                                                            active_robot,
+                                                            teleop,
+                                                            current_q,
+                                                            ik_worker.teleop_loop,
+                                                            logger,
+                                                        )
+                                                    )
+                                                state_container["q"] = result_q
+                                            finally:
+                                                with ee_demo_lock:
+                                                    ee_demo_running = False
+
+                                        threading.Thread(
+                                            target=_run_demo, daemon=True
+                                        ).start()
+                            elif key_lower == "r":
+                                with reload_lock:
+                                    if reload_running:
+                                        logger.info(
+                                            "Robot reload is already in progress"
+                                        )
+                                        state_container["reload_status"] = "reloading"
+                                        state_container["reload_detail"] = (
+                                            "Reload already running..."
+                                        )
+                                        continue
+                                    if ee_demo_running:
+                                        logger.info(
+                                            "Cannot reload while an EE demo is running"
+                                        )
+                                        state_container["reload_status"] = "failed"
+                                        state_container["reload_detail"] = (
+                                            "Blocked: wait for EE demo to finish"
+                                        )
+                                        continue
+                                    reload_running = True
+                                    state_container["reload_status"] = "reloading"
+                                    state_container["reload_detail"] = (
+                                        "Reloading robot class (solver unchanged)..."
+                                    )
+
+                                def _run_reload() -> None:
+                                    nonlocal reload_running, robot
+                                    try:
+                                        if controller is None:
+                                            return
+
+                                        logger.info(
+                                            "Reloading robot module in-place (preserving solver)..."
+                                        )
+
+                                        from teleop_xr.ik.loader import (
+                                            reload_robot_class,
+                                        )
+
+                                        new_robot_cls = reload_robot_class(
+                                            cli.robot_class
+                                        )
+                                        new_robot = new_robot_cls(**robot_args)
+                                        ok, detail, q_next = (
+                                            ik_worker.reload_robot_in_place(new_robot)
+                                        )
+                                        if not ok:
+                                            logger.warning(detail)
+                                            state_container["reload_status"] = "failed"
+                                            state_container["reload_detail"] = detail
+                                            return
+                                        robot = ik_worker.robot
+
+                                        if (
+                                            ik_worker.teleop_loop
+                                            and ik_worker.teleop_loop.is_running()
+                                        ):
+                                            joint_dict = {
+                                                name: float(val)
+                                                for name, val in zip(
+                                                    ik_worker.robot.actuated_joint_names,
+                                                    q_next,
+                                                )
+                                            }
+                                            asyncio.run_coroutine_threadsafe(
+                                                teleop.publish_joint_state(joint_dict),
+                                                ik_worker.teleop_loop,
                                             )
-                                            if current_q.size == 0:
-                                                return
-                                            if demo_key == "d":
-                                                result_q = run_right_ee_delta_demo(
-                                                    controller,
-                                                    robot,
-                                                    teleop,
-                                                    current_q,
-                                                    ik_worker.teleop_loop,
-                                                    logger,
-                                                )
-                                            else:
-                                                result_q = run_right_ee_absolute_demo(
-                                                    controller,
-                                                    robot,
-                                                    teleop,
-                                                    current_q,
-                                                    ik_worker.teleop_loop,
-                                                    logger,
-                                                )
-                                            state_container["q"] = result_q
-                                        finally:
-                                            with ee_demo_lock:
-                                                ee_demo_running = False
 
-                                    threading.Thread(
-                                        target=_run_demo, daemon=True
-                                    ).start()
+                                        logger.info(
+                                            "Robot class reload complete. Solver preserved."
+                                        )
+                                        state_container["reload_status"] = "done"
+                                        state_container["reload_detail"] = (
+                                            "Class reloaded (solver unchanged)"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Robot reload failed: {e}")
+                                        state_container["reload_status"] = "failed"
+                                        state_container["reload_detail"] = (
+                                            f"Reload failed: {type(e).__name__}"
+                                        )
+                                    finally:
+                                        with reload_lock:
+                                            reload_running = False
+
+                                threading.Thread(
+                                    target=_run_reload, daemon=True
+                                ).start()
                     else:
                         layout["events"].update(generate_event_panel(event_log))
                         layout["help"].update(generate_help_panel())
