@@ -15,6 +15,12 @@ import jaxlie  # noqa: E402
 from unittest.mock import patch  # noqa: E402
 from teleop_xr.ik.robot import BaseRobot  # noqa: E402
 from teleop_xr.ik.robots.h1_2 import UnitreeH1Robot  # noqa: E402
+from teleop_xr.ik.robots.vega import (  # noqa: E402
+    _VEGA_STANDING_POSE,
+    _dexmate_urdf_repo_path,
+    _vega_centering_weight,
+    _vega_rest_energy_weight,
+)
 
 H1_URDF = """
 <robot name="h1_2">
@@ -86,3 +92,26 @@ def test_h1_robot(tmp_path):
         assert robot.get_vis_config() is not None
         robot.urdf_path = ""
         assert robot.get_vis_config() is None
+
+
+def test_vega_variant_to_ram_path_mapping():
+    assert (
+        _dexmate_urdf_repo_path("vega_1.vega_1_f5d6")
+        == "robots/humanoid/vega_1/vega_1_f5d6.urdf"
+    )
+    assert (
+        _dexmate_urdf_repo_path("vega_1u.vega_1u_f5d6")
+        == "robots/humanoid/vega_1u/vega_1u_f5d6.urdf"
+    )
+
+
+def test_vega_standing_pose_values():
+    assert _VEGA_STANDING_POSE["torso_j1"] == 0.0
+    assert _VEGA_STANDING_POSE["head_j1"] == 0.0
+    assert _VEGA_STANDING_POSE["L_arm_j1"] == -1.57079
+    assert _VEGA_STANDING_POSE["R_arm_j1"] == 1.57079
+
+
+def test_vega_waist_weighting_bias():
+    assert _vega_rest_energy_weight("torso_j1") > _vega_rest_energy_weight("L_arm_j1")
+    assert _vega_centering_weight("torso_j1") > _vega_centering_weight("L_arm_j1")
