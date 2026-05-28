@@ -18,28 +18,6 @@ from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
 
 
-# ---------------------------------------------------------------------------
-# Frame callback registry
-# Maps stream_id (e.g. "head", "wrist_left") to callables that receive each
-# new BGR frame (np.ndarray HxWx3 uint8).  Callbacks run on the camera reader
-# thread — keep them cheap and exception-safe.
-# ---------------------------------------------------------------------------
-_FRAME_CALLBACKS: dict[str, list] = {}
-
-
-def register_frame_callback(stream_id: str, callback) -> None:
-    """Register a callback to receive each new BGR frame for stream_id."""
-    _FRAME_CALLBACKS.setdefault(stream_id, []).append(callback)
-
-
-def clear_frame_callbacks(stream_id: str | None = None) -> None:
-    """Clear callbacks for a stream id, or all streams if None."""
-    if stream_id is None:
-        _FRAME_CALLBACKS.clear()
-    else:
-        _FRAME_CALLBACKS.pop(stream_id, None)
-
-
 @dataclass(frozen=True)
 class VideoStreamConfig:
     id: str
@@ -91,9 +69,8 @@ class VideoSource(Protocol):
 
 
 class OpenCVVideoSource:
-    def __init__(self, src: int | str, width: int, height: int, fps: int, *, stream_id: str = ""):
+    def __init__(self, src: int | str, width: int, height: int, fps: int):
         self.src = src
-        self.stream_id = stream_id
         # Use V4L2 backend for Linux performance
         self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         # Minimize buffering
@@ -130,12 +107,8 @@ class OpenCVVideoSource:
                     self.frame = frame
                     self.grabbed = True
                 self.new_frame_event.set()
-                for cb in _FRAME_CALLBACKS.get(self.stream_id, ()):
-                    try:
-                        cb(frame)
-                    except Exception as exc:
-                        logging.warning(f"frame callback [{self.stream_id}] failed: {exc}")
             else:
+                # If read fails, wait briefly to avoid busy loop
                 time.sleep(0.01)
 
     def read(self) -> tuple[bool, np.ndarray | None]:
@@ -236,7 +209,6 @@ def build_sources(configs: list[VideoStreamConfig]) -> dict[str, VideoSource]:
                 cfg.width,
                 cfg.height,
                 cfg.fps,
-                stream_id=cfg.id,
             )
     return sources
 

@@ -68,13 +68,6 @@ def build_video_streams(camera_views: dict) -> dict:
     order = ["head", "wrist_left", "wrist_right"]
     streams = []
 
-    # All cameras are YUYV-only USB cameras; none support 1280x720@30fps.
-    # Head (video59): max listed is 848x480@30fps — use that for a wider VR view.
-    # Wrists (video65, video57): 640x480@30fps keeps USB 2.0 bandwidth safe
-    # (~14 MB/s vs the ~55 MB/s that caused partial green frames at 1280x720).
-    _HEAD_OVERRIDES = {"width": 1280, "height": 720, "fps": 30}  # USB 3.0 — full bandwidth available
-    _WRIST_OVERRIDES = {"width": 640, "height": 480, "fps": 30}
-
     # First, add ordered known keys
     for view_key in order:
         if view_key in camera_views:
@@ -85,12 +78,7 @@ def build_video_streams(camera_views: dict) -> dict:
             else:
                 device = val["device"]
 
-            entry = {"id": view_key, "device": device}
-            if view_key == "head":
-                entry.update(_HEAD_OVERRIDES)
-            elif view_key in ("wrist_left", "wrist_right"):
-                entry.update(_WRIST_OVERRIDES)
-            streams.append(entry)
+            streams.append({"id": view_key, "device": device})
 
     # Then add any other keys alphabetically
     extra_keys = sorted([k for k in camera_views.keys() if k not in order])
@@ -101,11 +89,6 @@ def build_video_streams(camera_views: dict) -> dict:
         else:
             device = val["device"]
 
-        entry = {"id": view_key, "device": device}
-        if view_key == "head":
-            entry.update(_HEAD_OVERRIDES)
-        elif view_key in ("wrist_left", "wrist_right"):
-            entry.update(_WRIST_OVERRIDES)
-        streams.append(entry)
+        streams.append({"id": view_key, "device": device})
 
     return {"streams": streams}

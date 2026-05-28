@@ -409,16 +409,13 @@ class Teleop:
         )
         received_pose = received_pose @ self.__natural_phone_pose
 
-        # Pose jump protection. Tolerances are intentionally generous because
-        # fast hand motion + WebRTC stutter on Quest legitimately exceeds the
-        # earlier 5 cm / 35° thresholds, causing spurious resets that snap the
-        # IK target and jerk the arm.
+        # Pose jump protection
         if self.__previous_received_pose is not None:
             if not are_close(
                 received_pose,
                 self.__previous_received_pose,
-                lin_tol=0.10,
-                ang_tol=math.radians(60),
+                lin_tol=0.05,
+                ang_tol=math.radians(35),
             ):
                 self.__logger.warning("Pose jump detected, resetting the pose")
                 self.__relative_pose_init = None

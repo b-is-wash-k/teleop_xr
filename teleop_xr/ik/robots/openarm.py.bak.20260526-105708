@@ -203,9 +203,7 @@ class OpenArmRobot(BaseRobot):
                 pk.costs.rest_cost(
                     JointVar(0),
                     rest_pose=q_current,
-                    # Higher rest_cost keeps the solver's solution close to the
-                    # previous q, reducing frame-to-frame joint flicker.
-                    weight=10.0,
+                    weight=5.0,
                 )
             )
 
@@ -249,10 +247,8 @@ class OpenArmRobot(BaseRobot):
                 self.robot,
                 self.robot_coll,
                 JointVar(0),
-                # Tighter margin + lower weight stops the solver from oscillating
-                # between rest_cost and self_collision_cost minima.
-                margin=0.02,
-                weight=5.0,
+                margin=0.05,
+                weight=10.0,
             )
         )
 
