@@ -88,7 +88,11 @@ class PyrokiSolver:
             initial_vals=initial_vals,
             verbose=False,
             linear_solver="dense_cholesky",
-            termination=jaxls.TerminationConfig(max_iterations=15),
+            # 15 -> 4 (re-applied 2026-06-16): faster solve (35ms -> 16ms) lifts
+            # the /joint_trajectory command rate; 4-vs-15 output differs <=0.009
+            # rad, invisible in warm-started streaming teleop. Raise to 6-8 if
+            # tracking looks under-converged.
+            termination=jaxls.TerminationConfig(max_iterations=4),
         )
 
         # Return the optimized joint configuration for the first (and only) timestep

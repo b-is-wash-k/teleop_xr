@@ -72,7 +72,7 @@ def build_video_streams(camera_views: dict) -> dict:
     # Head (video59): max listed is 848x480@30fps — use that for a wider VR view.
     # Wrists (video65, video57): 640x480@30fps keeps USB 2.0 bandwidth safe
     # (~14 MB/s vs the ~55 MB/s that caused partial green frames at 1280x720).
-    _HEAD_OVERRIDES = {"width": 1280, "height": 720, "fps": 30}  # USB 3.0 — full bandwidth available
+    _HEAD_OVERRIDES = {"width": 640, "height": 480, "fps": 30}  # 720p->480p (re-applied 2026-06-16): less GIL load on the IK loop; recorder gets 640x480 anyway. Revert to 1280x720 if VR head-view quality matters more than command rate.
     _WRIST_OVERRIDES = {"width": 640, "height": 480, "fps": 30}
 
     # First, add ordered known keys

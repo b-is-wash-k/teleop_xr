@@ -47,6 +47,8 @@ try:
     from control_msgs.action import GripperCommand
     from sensor_msgs.msg import Image
     from std_msgs.msg import Bool
+    from std_msgs.msg import Float64  # GRIPPER INTENT ECHO: publish the commanded gripper position so the recorder can log true intent (0.0 close / 0.12 open) instead of measured jaw gap
+    from geometry_msgs.msg import PointStamped  # DEBUG: publish raw XR controller position so the debug recorder can see if the controller kept moving while the arm froze
     HAS_ROS2 = True
 except ImportError:
     HAS_ROS2 = False
@@ -111,6 +113,19 @@ class IKJointTrajectoryPublisher(Node):
             '/right_gripper_controller/gripper_cmd'
         )
         
+        # GRIPPER INTENT ECHO publishers.
+        # ROS2 action goals travel over a service (_action/send_goal), NOT a topic,
+        # so the lerobot recorder cannot subscribe to the GripperCommand goal directly.
+        # We mirror the commanded position onto a plain topic here, at the source, so
+        # the recorder can cache it and write it into the gripper slot of `action`.
+        # This captures the true squeeze INTENT (0.0 = close/hold, 0.12 = open) rather
+        # than the measured jaw gap from /joint_states (which stalls at the cube width
+        # ~0.078 during a grasp and would teach the policy NOT to squeeze).
+        self.left_gripper_cmd_echo_pub = self.create_publisher(
+            Float64, '/left_gripper_cmd_echo', 10)
+        self.right_gripper_cmd_echo_pub = self.create_publisher(
+            Float64, '/right_gripper_cmd_echo', 10)
+        
         # ✅ WAIT FOR GRIPPER SERVERS
         self.get_logger().info("Waiting for gripper action servers...")
         left_ready = self.left_gripper_client.wait_for_server(timeout_sec=10.0)
@@ -130,7 +145,19 @@ class IKJointTrajectoryPublisher(Node):
         # Track gripper state to avoid duplicate commands
         self._last_left_gripper_pos = None
         self._last_right_gripper_pos = None
-        
+
+        # GRIPPER DEBOUNCE (2026-06-15): a floating/bouncing Quest trigger fires
+        # many rapid open/close edges — seen as bursts of 4+ action goals within
+        # <1 s AND the IDLE controller's gripper firing on its own. That flood of
+        # GripperCommand goals overloads the controller_manager and stutters the
+        # 150 Hz arm loop (the "freeze/lag right after closing the gripper").
+        # We rate-limit goals to one per _GRIP_MIN_INTERVAL per side and always
+        # converge to the LATEST desired position via flush_grippers().
+        self._grip_desired = {"left": GRIPPER_CLOSE_POSITION,
+                              "right": GRIPPER_CLOSE_POSITION}
+        self._grip_last_send = {"left": 0.0, "right": 0.0}
+        self._GRIP_MIN_INTERVAL = 0.2  # s -> at most 5 gripper goals/s/side
+
         self.joint_names = []
         self.get_logger().info("[ROS2] JointTrajectory publisher initialized on /joint_trajectory")
         self.get_logger().info("[ROS2] Gripper action clients initialized")
@@ -148,6 +175,64 @@ class IKJointTrajectoryPublisher(Node):
 
         self._reset_callback = None
         self.create_subscription(Bool, '/teleop_xr/reset', self._cb_reset, 1)
+
+        # DEBUG TELEMETRY (2026-06-15): expose internal teleop state on plain
+        # topics so lerobot_recorder_debug.py can time-align it with the arm and
+        # answer, at the gripper-close freeze: did the XR controller keep moving?
+        # was IK still engaged? did the command (/joint_trajectory) keep moving
+        # while the arm (/joint_states) froze, or did everything stop?
+        #   /teleop_xr/ik_active     Bool   — IKController.active (engaged or not)
+        #   /teleop_xr/xr_{l,r}_pos  PointStamped — raw XR controller position
+        self.ik_active_pub = self.create_publisher(Bool, '/teleop_xr/ik_active', 10)
+        self.xr_pos_pub = {
+            "left":  self.create_publisher(PointStamped, '/teleop_xr/xr_left_pos', 10),
+            "right": self.create_publisher(PointStamped, '/teleop_xr/xr_right_pos', 10),
+        }
+        #   /teleop_xr/ik_target_{l,r} — the teleop TARGET EE position the solver
+        #   is asked to reach. If this MOVES at the freeze but joints don't, the
+        #   solver is pinned; if it's FROZEN, it's input/snapshot.
+        self.ik_target_pub = {
+            "left":  self.create_publisher(PointStamped, '/teleop_xr/ik_target_left', 10),
+            "right": self.create_publisher(PointStamped, '/teleop_xr/ik_target_right', 10),
+        }
+
+    def publish_ik_target(self, target_xyz: dict) -> None:
+        """Publish the last teleop target EE translations (debug only)."""
+        try:
+            stamp = self.get_clock().now().to_msg()
+            for side, xyz in target_xyz.items():
+                if side not in self.ik_target_pub or xyz is None:
+                    continue
+                msg = PointStamped()
+                msg.header.stamp = stamp
+                msg.point.x = float(xyz[0])
+                msg.point.y = float(xyz[1])
+                msg.point.z = float(xyz[2])
+                self.ik_target_pub[side].publish(msg)
+        except Exception:
+            pass
+
+    def publish_ik_debug(self, active: bool, xr_state) -> None:
+        """Publish IK-engaged flag + raw XR controller positions (debug only)."""
+        try:
+            self.ik_active_pub.publish(Bool(data=bool(active)))
+            stamp = self.get_clock().now().to_msg()
+            for dev in xr_state.devices:
+                role = dev.role.value if dev.role else None
+                hand = dev.handedness.value if dev.handedness else None
+                if role != "controller" or hand not in ("left", "right"):
+                    continue
+                pose = dev.gripPose or dev.pose
+                if not pose:
+                    continue
+                msg = PointStamped()
+                msg.header.stamp = stamp
+                msg.point.x = float(pose.position.get("x", 0.0))
+                msg.point.y = float(pose.position.get("y", 0.0))
+                msg.point.z = float(pose.position.get("z", 0.0))
+                self.xr_pos_pub[hand].publish(msg)
+        except Exception:
+            pass
 
     def _cb_reset(self, _msg: "Bool") -> None:
         if self._reset_callback:
@@ -175,40 +260,94 @@ class IKJointTrajectoryPublisher(Node):
         point.time_from_start.nanosec = 10_000_000
         msg.points = [point]
         self.joint_traj_pub.publish(msg)
-    
+
+    def publish_trajectory_timed(self, joint_names: list[str], q_target: np.ndarray,
+                                 duration_sec: float = 2.5):
+        """One-shot timed move to q_target. For reset/home — NOT for streaming IK.
+
+        Unlike publish_trajectory (10 ms point, meant for per-frame IK streaming),
+        this gives JTC a real duration so it splines smoothly from the current
+        pose to the target instead of snapping. Use for reset to avoid the
+        high-jerk lurch that torques the arm and its mount.
+        """
+        msg = JointTrajectory()
+        msg.header.stamp.sec = 0
+        msg.header.stamp.nanosec = 0
+        msg.header.frame_id = "world"
+        msg.joint_names = joint_names
+
+        point = JointTrajectoryPoint()
+        point.positions = [float(angle) for angle in q_target]
+        point.time_from_start.sec = int(duration_sec)
+        point.time_from_start.nanosec = int((duration_sec - int(duration_sec)) * 1e9)
+        msg.points = [point]
+        self.joint_traj_pub.publish(msg)
+
     def send_gripper_command(self, side: str, position: float):
         """
-        Send gripper command via action server.
-        
+        Record the DESIRED gripper position and send it, rate-limited.
+
         Args:
             side: "left" or "right"
-            position: 0.0 (closed) to 0.03 (open) in meters
+            position: 0.0 (closed) to 0.12 (open) in meters
+
+        Rate-limiting (see __init__ GRIPPER DEBOUNCE): a bouncing trigger used to
+        flood the controller; now at most one goal per _GRIP_MIN_INTERVAL/side is
+        sent. Deferred commands are flushed by flush_grippers() so the gripper
+        still converges to the final commanded state.
         """
-        # Dedup near-identical gripper commands so we don't spam the action server.
+        self._grip_desired[side] = position
+        self._maybe_send_gripper(side)
+
+    def _maybe_send_gripper(self, side: str) -> None:
+        position = self._grip_desired[side]
+        last = (self._last_left_gripper_pos if side == "left"
+                else self._last_right_gripper_pos)
+        # Already at the desired position — nothing to send.
+        if last is not None and abs(position - last) < 0.001:
+            return
+        now = time.monotonic()
+        if now - self._grip_last_send[side] < self._GRIP_MIN_INTERVAL:
+            return  # within the rate-limit window; flush_grippers() sends it later
+        self._do_send_gripper(side, position, now)
+
+    def flush_grippers(self) -> None:
+        """Send any deferred gripper command once its rate-limit window passes.
+
+        Call this regularly from the main loop. It makes a fast or bouncy toggle
+        converge to the final commanded state (within ~_GRIP_MIN_INTERVAL)
+        without ever flooding the controller_manager.
+        """
+        self._maybe_send_gripper("left")
+        self._maybe_send_gripper("right")
+
+    def _do_send_gripper(self, side: str, position: float, now: float) -> None:
         if side == "left":
-            if self._last_left_gripper_pos is not None and \
-               abs(position - self._last_left_gripper_pos) < 0.001:
-                return
             self._last_left_gripper_pos = position
             client = self.left_gripper_client
         else:
-            if self._last_right_gripper_pos is not None and \
-               abs(position - self._last_right_gripper_pos) < 0.001:
-                return
             self._last_right_gripper_pos = position
             client = self.right_gripper_client
-        
-        
+        self._grip_last_send[side] = now
+
         try:
             goal = GripperCommand.Goal()
             goal.command.position = float(position)
             goal.command.max_effort = GRIPPER_MAX_EFFORT
-            
+
             # Send goal asynchronously
             client.send_goal_async(goal)
             self.get_logger().info(
                 f"GRIPPER {side.upper()}: position={position:.3f}m"
             )
+
+            # GRIPPER INTENT ECHO: mirror the commanded position onto a plain topic
+            # so the lerobot recorder can log the true squeeze intent. Only fires
+            # when a command actually goes out, in the same 0.0..0.12 space that
+            # deploy commands.
+            echo_pub = (self.left_gripper_cmd_echo_pub if side == "left"
+                        else self.right_gripper_cmd_echo_pub)
+            echo_pub.publish(Float64(data=float(position)))
         except Exception as e:
             self.get_logger().error(f"Gripper {side} error: {e}")
 
@@ -527,6 +666,13 @@ class IKWorker(threading.Thread):
                     self.state_container["active"] = self.controller.active
                     is_active = self.controller.active
 
+                    # DEBUG: publish the teleop target EE position(s) the solver
+                    # was asked to reach this step (freeze diagnosis).
+                    if self.ros2_node and getattr(
+                            self.controller, "last_target_xyz", None):
+                        self.ros2_node.publish_ik_target(
+                            self.controller.last_target_xyz)
+
                     if not was_active and is_active:
                         self.logger.info("in_control start - Taking Snapshots")
                         self.logger.info(
@@ -757,7 +903,10 @@ def main():
             asyncio.run_coroutine_threadsafe(
                 teleop.publish_joint_state(joint_dict), ik_worker.teleop_loop)
             if ros2_node:
-                ros2_node.publish_trajectory(robot.actuated_joint_names, default_q)
+                # Timed move (2.5 s) instead of the 10 ms streaming point, so the
+                # reset splines smoothly to home rather than snapping hard.
+                # was: ros2_node.publish_trajectory(robot.actuated_joint_names, default_q)
+                ros2_node.publish_trajectory_timed(robot.actuated_joint_names, default_q, duration_sec=2.5)
         logger.info("Robot reset to start pose")
 
     if ros2_node:
@@ -793,20 +942,22 @@ def main():
             ros2_node.send_gripper_command(side, GRIPPER_OPEN_POSITION)
             state_container[f"gripper_{side}"] = "OPEN"
 
-            # Also update the ghost visualization
+            # Also update the ghost visualization.
+            # RACE FIX (2026-06-15): mutate ONLY the finger slots IN PLACE. The old
+            # code copied q, edited the finger, then wrote the WHOLE array back —
+            # which clobbered the IK worker's concurrent arm-joint update (it does
+            # state_container["q"] = new_config every cycle), snapping the arm back
+            # to its trigger-time pose when the gripper was toggled mid-motion.
+            # In-place finger writes can never revert the arm joints.
             if robot is not None and ik_worker is not None and ik_worker.teleop_loop:
-                current_q = state_container["q"].copy()
                 joint_names = robot.actuated_joint_names
-                
                 # URDF limit is 0.044, so clamp the viz value
                 viz_value = min(GRIPPER_OPEN_POSITION, 0.044)
-                
+                q = state_container["q"]
                 for i, name in enumerate(joint_names):
                     if f"{side}_finger_joint" in name:   # catches joint1 and joint2
-                        current_q[i] = viz_value
-                
-                state_container["q"] = current_q
-                joint_dict = {n: float(v) for n, v in zip(joint_names, current_q)}
+                        q[i] = viz_value
+                joint_dict = {n: float(v) for n, v in zip(joint_names, q)}
                 asyncio.run_coroutine_threadsafe(
                     teleop.publish_joint_state(joint_dict),
                     ik_worker.teleop_loop,
@@ -825,13 +976,16 @@ def main():
             ros2_node.send_gripper_command(side, GRIPPER_CLOSE_POSITION)
             state_container[f"gripper_{side}"] = "CLOSED"
 
-            # Reset finger joint in viz state so IK trajectory reflects closed gripper
+            # Reset finger joint in viz state so IK trajectory reflects closed gripper.
+            # RACE FIX (2026-06-15): mutate ONLY the finger slots in place (see
+            # on_trigger_down). Writing the whole q array back here was clobbering
+            # the IK worker's arm update and jerking the arm on the open->close
+            # toggle — the exact "behaves oddly after open then close" symptom.
             if robot is not None and ik_worker is not None and ik_worker.teleop_loop:
-                current_q = state_container["q"].copy()
+                q = state_container["q"]
                 for i, name in enumerate(robot.actuated_joint_names):
                     if f"{side}_finger_joint" in name:
-                        current_q[i] = GRIPPER_CLOSE_POSITION
-                state_container["q"] = current_q
+                        q[i] = GRIPPER_CLOSE_POSITION
 
             logger.info(f"{side.upper()} gripper CLOSED (trigger released)")
         
@@ -883,6 +1037,13 @@ def main():
 
             if ik_worker:
                 ik_worker.update_state(state)
+
+            # DEBUG TELEMETRY: mirror IK-engaged + XR controller positions onto
+            # topics so the debug recorder can see input vs command vs arm at the
+            # freeze. Runs at XR rate; rclpy publishers are thread-safe.
+            if ros2_node is not None:
+                ros2_node.publish_ik_debug(
+                    state_container.get("active", False), state)
         except Exception:
             pass
 
@@ -963,6 +1124,9 @@ def main():
                     # incoming callbacks (fires at 10 Hz, negligible DDS load).
                     if ros2_node:
                         rclpy.spin_once(ros2_node, timeout_sec=0)
+                        # Flush any gripper command deferred by the rate-limiter so
+                        # a fast/bouncy toggle still reaches its final state.
+                        ros2_node.flush_grippers()
 
                     key = key_reader.poll_key()
                     if key and key.lower() == 'r':

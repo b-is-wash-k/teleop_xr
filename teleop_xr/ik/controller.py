@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
@@ -51,6 +52,7 @@ class IKController:
         # Snapshots
         self.snapshot_xr = {}
         self.snapshot_robot = {}
+        self.last_target_xyz: dict = {}   # DEBUG: last teleop target translations
 
         # Filter for joint configuration
         self.filter = None
@@ -252,6 +254,31 @@ class IKController:
         )
         return jaxlie.SE3.from_rotation_and_translation(rotation, translation)
 
+    # JIT'd body of compute_teleop_transform (re-applied 2026-06-16). Running
+    # these ~15 small jaxlie ops eagerly cost ~5 ms PER HAND per step (~10 ms/
+    # frame) — a third of the command-rate budget. One jitted call per hand is
+    # ~microseconds after the first trace. All args are jaxlie pytrees, so jit
+    # handles them directly. Verified bit-identical to the eager math (diff 0.0).
+    @staticmethod
+    @jax.jit
+    def _teleop_transform_jit(
+        t_ctrl_curr: jaxlie.SE3,
+        t_ctrl_init: jaxlie.SE3,
+        t_ee_init: jaxlie.SE3,
+        ros_to_base: jaxlie.SO3,
+        base_to_ros: jaxlie.SO3,
+    ) -> jaxlie.SE3:
+        t_delta_ros = t_ctrl_curr.translation() - t_ctrl_init.translation()
+        t_delta_robot = ros_to_base @ t_delta_ros
+
+        q_delta_ros = t_ctrl_curr.rotation() @ t_ctrl_init.rotation().inverse()
+        q_delta_robot = ros_to_base @ q_delta_ros @ base_to_ros
+
+        t_new = t_ee_init.translation() + t_delta_robot
+        q_new = q_delta_robot @ t_ee_init.rotation()
+
+        return jaxlie.SE3.from_rotation_and_translation(q_new, t_new)
+
     def compute_teleop_transform(
         self, t_ctrl_curr: jaxlie.SE3, t_ctrl_init: jaxlie.SE3, t_ee_init: jaxlie.SE3
     ) -> jaxlie.SE3:
@@ -266,16 +293,13 @@ class IKController:
         Returns:
             jaxlie.SE3: The calculated target pose for the robot end-effector.
         """
-        t_delta_ros = t_ctrl_curr.translation() - t_ctrl_init.translation()
-        t_delta_robot = self.robot.ros_to_base @ t_delta_ros
-
-        q_delta_ros = t_ctrl_curr.rotation() @ t_ctrl_init.rotation().inverse()
-        q_delta_robot = self.robot.ros_to_base @ q_delta_ros @ self.robot.base_to_ros
-
-        t_new = t_ee_init.translation() + t_delta_robot
-        q_new = q_delta_robot @ t_ee_init.rotation()
-
-        return jaxlie.SE3.from_rotation_and_translation(q_new, t_new)
+        return self._teleop_transform_jit(
+            t_ctrl_curr,
+            t_ctrl_init,
+            t_ee_init,
+            self.robot.ros_to_base,
+            self.robot.base_to_ros,
+        )
 
     def _get_device_poses(self, state: XRState) -> dict[str, jaxlie.SE3]:
         """
@@ -395,6 +419,15 @@ class IKController:
                     self.snapshot_xr["head"],
                     self.snapshot_robot["head"],
                 )
+
+            # DEBUG (2026-06-15): expose the teleop targets so the worker can
+            # publish them. Lets the debug recorder tell, at the grasp freeze,
+            # whether the TARGET kept moving (=> solver pinned) or was frozen
+            # (=> input/snapshot). Translations only; cheap.
+            self.last_target_xyz = {}
+            for _name, _tgt in (("left", target_L), ("right", target_R)):
+                if _tgt is not None:
+                    self.last_target_xyz[_name] = np.asarray(_tgt.translation())
 
             if self.solver is not None:
                 # Solve for new configuration using target poses and current config

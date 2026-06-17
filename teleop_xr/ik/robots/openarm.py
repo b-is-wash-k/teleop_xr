@@ -30,7 +30,33 @@ class OpenArmRobot(BaseRobot):
         urdf = self._load_urdf(urdf_string)
 
         self.robot: pk.Robot = pk.Robot.from_urdf(urdf)
-        self.robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
+        # GRIPPER SELF-COLLISION FIX (2026-06-15): the IK's self-collision model
+        # guards a gripper's OWN links (hand + its two jaw fingers) against each
+        # OTHER. When you close the gripper, the fingers drive toward the hand /
+        # toward each other; those intra-gripper pairs register as self-collision
+        # (measured: openarm_right_hand <-> openarm_right_*_finger penetrating
+        # ~-0.09 at the frozen config). self_collision_cost (weight 5) fights it,
+        # pinning the finger ~0.036 off its 0.0 command, and — because the finger
+        # joints are coupled to the arm joints in the Gauss-Newton solve — it
+        # FREEZES the whole arm for 200-500 ms right after a close while the IK
+        # target keeps moving (confirmed via /teleop_xr/ik_target telemetry).
+        # A gripper's own hand+jaws are SUPPOSED to be near/touch each other (that
+        # IS grasping), so make each gripper internally collision-transparent.
+        # Arm-vs-arm and arm-vs-body collisions stay fully protected.
+        import itertools as _it
+        _grip_links = {
+            "left":  ["openarm_left_hand",  "openarm_left_left_finger",
+                      "openarm_left_right_finger"],
+            "right": ["openarm_right_hand", "openarm_right_left_finger",
+                      "openarm_right_right_finger"],
+        }
+        _grip_ignore = tuple(
+            pair
+            for links in _grip_links.values()
+            for pair in _it.combinations(links, 2)
+        )
+        self.robot_coll = pk.collision.RobotCollision.from_urdf(
+            urdf, user_ignore_pairs=_grip_ignore)
 
         # End effector links for bimanual setup
         self.L_ee: str = "openarm_left_link7"
@@ -159,26 +185,49 @@ class OpenArmRobot(BaseRobot):
         #     "openarm_right_finger_joint2": 0.0,
         # }
 
+        # default_pose = {
+        #     "openarm_left_joint1": 0.0,
+        #     "openarm_left_joint2": -0.1,
+        #     "openarm_left_joint3": 0.0,
+        #     "openarm_left_joint4": 0.1,
+        #     "openarm_left_joint5": 0.0,
+        #     "openarm_left_joint6": 0.0,
+        #     "openarm_left_joint7": 0.0,
+        #     "openarm_right_joint1": 0.0,
+        #     "openarm_right_joint2": 0.1,
+        #     "openarm_right_joint3": 0.0,
+        #     "openarm_right_joint4": 0.1,
+        #     "openarm_right_joint5": 0.0,
+        #     "openarm_right_joint6": 0.0,
+        #     "openarm_right_joint7": 0.0,
+        #     "openarm_left_finger_joint1": 0.0,
+        #     "openarm_left_finger_joint2": 0.0,
+        #     "openarm_right_finger_joint1": 0.0,
+        #     "openarm_right_finger_joint2": 0.0,
+        # }
+
         default_pose = {
-            "openarm_left_joint1": 0.0,
+            "openarm_left_joint1": 0.3,
             "openarm_left_joint2": -0.1,
             "openarm_left_joint3": 0.0,
             "openarm_left_joint4": 0.1,
             "openarm_left_joint5": 0.0,
             "openarm_left_joint6": 0.0,
             "openarm_left_joint7": 0.0,
-            "openarm_right_joint1": 0.0,
-            "openarm_right_joint2": 0.1,
-            "openarm_right_joint3": 0.0,
-            "openarm_right_joint4": 0.1,
-            "openarm_right_joint5": 0.0,
-            "openarm_right_joint6": 0.0,
-            "openarm_right_joint7": 0.0,
+            # Right arm: recording home pose — matches FINAL in the sequenced mover
+            "openarm_right_joint1": 0.192,
+            "openarm_right_joint2": 0.750,
+            "openarm_right_joint3": -0.688,
+            "openarm_right_joint4": 0.964,
+            "openarm_right_joint5": 0.000,
+            "openarm_right_joint6": 0.683,
+            "openarm_right_joint7": 0.930,
             "openarm_left_finger_joint1": 0.0,
             "openarm_left_finger_joint2": 0.0,
             "openarm_right_finger_joint1": 0.0,
             "openarm_right_finger_joint2": 0.0,
         }
+
 
 
         config_list = []
